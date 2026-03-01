@@ -73,11 +73,53 @@ def get_historical_prices():
     closes = [item["value"] for item in items]
     return closes[::-1]
 
-def calculate_rsi_and_ma(closes):
-    # Your original RSI calc - keep it
-    # ... (paste your calculate_rsi_and_ma function here from previous code)
-    pass  # replace with your full function
+def def calculate_rsi_and_ma(closes):
+    if len(closes) < RSI_PERIOD + YELLOW_MA_PERIOD + 5:
+        return None, None, None
 
+    
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+
+    
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+
+    
+    avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
+    avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
+
+    
+    rsi = []
+
+    
+    if avg_loss == 0:
+        rsi.append(100.0)
+    else:
+        rs = avg_gain / avg_loss
+        rsi.append(100 - (100 / (1 + rs)))
+
+    
+    for i in range(RSI_PERIOD, len(gains)):
+        avg_gain = (avg_gain * (RSI_PERIOD - 1) + gains[i]) / RSI_PERIOD
+        avg_loss = (avg_loss * (RSI_PERIOD - 1) + losses[i]) / RSI_PERIOD
+
+        if avg_loss == 0:
+            rsi.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi.append(100 - (100 / (1 + rs)))
+
+    
+    current_rsi = rsi[-1]
+    prev_rsi = rsi[-2] if len(rsi) > 1 else current_rsi
+
+    
+    if len(rsi) < YELLOW_MA_PERIOD:
+        yellow_ma = None
+    else:
+        yellow_ma = sum(rsi[-YELLOW_MA_PERIOD:]) / YELLOW_MA_PERIOD
+
+    return current_rsi, prev_rsi, yellow_ma
 def get_current_price():
     url = f"https://public-api.birdeye.so/defi/price?address={str(TOKEN_ADDRESS)}"
     response = requests.get(url, headers=HEADERS)
