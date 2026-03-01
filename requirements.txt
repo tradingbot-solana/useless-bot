@@ -1,1 +1,5 @@
 requests
+solders
+solana
+jupiter-python-sdk
+bip_utils  # if using seed phrase
