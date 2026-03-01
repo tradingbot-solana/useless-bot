@@ -21,7 +21,8 @@ YELLOW_MA_PERIOD = 9
 STOP_LOSS_PCT = 0.05
 POSITION_SIZE_PCT = 0.80
 STATE_FILE = "useless_agent_state.json"
-# ====================================
+
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 HEADERS = {
     "accept": "application/json",
@@ -41,7 +42,7 @@ def save_state(state):
 
 def get_historical_prices():
     now_unix = int(time.time())
-    from_unix = now_unix - (3600 * 24 * 2)  # ~2 days back for enough candles
+    from_unix = now_unix - (3600 * 24 * 2)
     url = f"https://public-api.birdeye.so/defi/history_price?address={TOKEN_ADDRESS}&address_type=token&type=15m&time_from={from_unix}&time_to={now_unix}&ui_amount_mode=raw"
     response = requests.get(url, headers=HEADERS)
     response.raise_for_status()
@@ -49,7 +50,7 @@ def get_historical_prices():
     if not data.get("success"):
         raise ValueError("Birdeye API error: " + str(data))
     items = data["data"]["items"]
-    closes = [item["value"] for item in items]  # newest first → reverse for oldest first
+    closes = [item["value"] for item in items]
     return closes[::-1]
 
 def calculate_rsi_and_ma(closes):
@@ -96,44 +97,49 @@ def get_current_price():
         raise ValueError("Birdeye price error")
     return float(data["data"]["value"])
 
-def import subprocess
+def execute_swap(from_token, to_token, amount_pct=None):
+    amount = "0.8"
+    if amount_pct is not None:
+        amount = str(amount_pct)
 
-print("[LONG CROSSOVER detected → Buying]")
+    swap_command = [
+        "mp",
+        "token",
+        "swap",
+        "--chain", "solana",
+        "--from-token", from_token,
+        "--to-token", to_token,
+        "--from-amount", amount,
+        "--wallet", MOONPAY_WALLET,
+        "--confirm"
+    ]
 
-swap_command = [
-    "mp",
-    "token",
-    "swap",
-    "--chain", "solana",
-    "--from-token", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-    "--to-token", TOKEN_ADDRESS,
-    "--from-amount", "0.8",
-    "--wallet", MOONPAY_WALLET,
-    "--confirm"
-]
+    print("Executing:", " ".join(swap_command))
 
-print("Executing:", " ".join(swap_command))
+    try:
+        result = subprocess.run(
+            swap_command,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        print("Moonpay CLI stdout:", result.stdout.strip())
+        print("Moonpay CLI stderr:", result.stderr.strip())
+        
+        if result.returncode == 0:
+            print("Swap SUCCESS! Transaction completed.")
+            return True
+        else:
+            print(f"Swap FAILED with exit code {result.returncode}")
+            return False
+    except Exception as e:
+        print("Error running Moonpay CLI command:", str(e))
+        return False
 
-try:
-    result = subprocess.run(
-        swap_command,
-        capture_output=True,
-        text=True,
-        check=False
-    )
-    
-    print("Moonpay CLI stdout:", result.stdout.strip())
-    print("Moonpay CLI stderr:", result.stderr.strip())
-    
-    if result.returncode == 0:
-        print("Swap SUCCESS! Transaction completed.")
-    
-    else:
-        print(f"Swap FAILED with exit code {result.returncode}")
-    
-
-except Exception as e:
-    print("Error running Moonpay CLI command:", str(e))
+# =============================================================================
+# MAIN
+# =============================================================================
 
 state = load_state()
 print(f"[{datetime.now()}] Useless Coin Crossover Agent STARTED (Birdeye + MoonPay CLI)")
@@ -154,24 +160,24 @@ while True:
         crossover_up = (prev_rsi <= yellow_ma) and (current_rsi > yellow_ma)
         crossover_down = (prev_rsi >= yellow_ma) and (current_rsi < yellow_ma)
 
-        if state["position"] == "USELESS" and state["entry_price"] is not None:
+        if state["position"] == TOKEN_ADDRESS and state["entry_price"] is not None:
             if current_price <= state["entry_price"] * (1 - STOP_LOSS_PCT):
                 print(f"[{datetime.now()}] STOP-LOSS TRIGGERED at {current_price}")
-                if execute_swap(TOKEN_ADDRESS, BASE_TOKEN):
+                if execute_swap(TOKEN_ADDRESS, USDC_MINT):
                     state["position"] = BASE_TOKEN
                     state["entry_price"] = None
                     save_state(state)
 
         elif crossover_up and state["position"] == BASE_TOKEN:
             print(f"[{datetime.now()}] LONG CROSSOVER detected → Buying")
-            if execute_swap(BASE_TOKEN, TOKEN_ADDRESS, POSITION_SIZE_PCT):
-                state["position"] = "USELESS"
+            if execute_swap(USDC_MINT, TOKEN_ADDRESS, POSITION_SIZE_PCT):
+                state["position"] = TOKEN_ADDRESS
                 state["entry_price"] = current_price
                 save_state(state)
 
-        elif crossover_down and state["position"] == "USELESS":
+        elif crossover_down and state["position"] == TOKEN_ADDRESS:
             print(f"[{datetime.now()}] SHORT CROSSOVER detected → Selling")
-            if execute_swap(TOKEN_ADDRESS, BASE_TOKEN):
+            if execute_swap(TOKEN_ADDRESS, USDC_MINT):
                 state["position"] = BASE_TOKEN
                 state["entry_price"] = None
                 save_state(state)
