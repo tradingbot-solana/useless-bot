@@ -73,10 +73,43 @@ def get_historical_prices():
     closes = [item["value"] for item in items]
     return closes[::-1]
 
-def def calculate_rsi_and_ma(closes):
+def calculate_rsi_and_ma(closes):
     if len(closes) < RSI_PERIOD + YELLOW_MA_PERIOD + 5:
         return None, None, None
 
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+
+    avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
+    avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
+
+    rsi = []
+    if avg_loss == 0:
+        rsi.append(100.0)
+    else:
+        rs = avg_gain / avg_loss
+        rsi.append(100 - (100 / (1 + rs)))
+
+    for i in range(RSI_PERIOD, len(gains)):
+        avg_gain = (avg_gain * (RSI_PERIOD - 1) + gains[i]) / RSI_PERIOD
+        avg_loss = (avg_loss * (RSI_PERIOD - 1) + losses[i]) / RSI_PERIOD
+
+        if avg_loss == 0:
+            rsi.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi.append(100 - (100 / (1 + rs)))
+
+    current_rsi = rsi[-1]
+    prev_rsi = rsi[-2] if len(rsi) > 1 else current_rsi
+
+    if len(rsi) < YELLOW_MA_PERIOD:
+        yellow_ma = None
+    else:
+        yellow_ma = sum(rsi[-YELLOW_MA_PERIOD:]) / YELLOW_MA_PERIOD
+
+    return current_rsi, prev_rsi, yellow_ma
     
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
 
@@ -129,28 +162,56 @@ def get_current_price():
         raise ValueError("Birdeye price error")
     return float(data["data"]["value"])
 
+def import base64  # Add this import at the top of the file if not there
+
 def execute_swap(from_mint, to_mint, amount):
-    print(f"Swapping {amount} of {from_mint} to {to_mint}")
+    print(f"Trying to swap {amount} from {from_mint} to {to_mint}")
+
+    # Step 1: Get quote
+    quote_url = "https://quote-api.jup.ag/v6/quote"
+    params = {
+        "inputMint": str(from_mint),
+        "outputMint": str(to_mint),
+        "amount": int(amount * 1_000_000),  # USDC = 6 decimals; BONK usually 5 — adjust if needed
+        "slippageBps": 50  # 0.5% max slippage
+    }
+
     try:
-        quote = jupiter.quote(
-            input_mint=from_mint,
-            output_mint=to_mint,
-            amount=int(amount * 1_000_000),  # USDC has 6 decimals
-            slippage_bps=50  # 0.5%
-        )
-        swap_tx = jupiter.swap_transaction(
-            quote_response=quote,
-            user_public_key=keypair.pubkey()
-        )
-        tx = Transaction.deserialize(swap_tx.swapTransaction)
-        tx.sign([keypair])
-        signature = rpc_client.send_transaction(tx)
-        print(f"Swap SUCCESS! Signature: {signature.value}")
-        return True
+        quote_resp = requests.get(quote_url, params=params)
+        quote_resp.raise_for_status()
+        quote = quote_resp.json()
     except Exception as e:
-        print(f"Swap failed: {e}")
+        print(f"Quote failed: {e}")
         return False
 
+    # Step 2: Get serialized swap transaction
+    swap_url = "https://quote-api.jup.ag/v6/swap"
+    payload = {
+        "quoteResponse": quote,
+        "userPublicKey": str(keypair.pubkey()),
+        "wrapAndUnwrapSol": True,
+        "computeUnitPriceMicroLamports": 100000  # priority fee, optional
+    }
+
+    try:
+        swap_resp = requests.post(swap_url, json=payload)
+        swap_resp.raise_for_status()
+        swap_data = swap_resp.json()
+        tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+    except Exception as e:
+        print(f"Swap tx request failed: {e}")
+        return False
+
+    # Step 3: Sign and send
+    try:
+        tx = Transaction.deserialize(tx_bytes)
+        tx.sign([keypair])
+        sig = rpc_client.send_transaction(tx)
+        print(f"Swap SUCCESS! Signature: {sig.value}")
+        return True
+    except Exception as e:
+        print(f"Transaction failed: {e}")
+        return False
 # MAIN LOOP
 state = load_state()
 print(f"[{datetime.now()}] Useless Coin Crossover Agent STARTED (Phantom Wallet Only)")
