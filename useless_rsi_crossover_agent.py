@@ -103,15 +103,14 @@ def execute_swap(from_token, to_token, amount_pct=None):
         amount = str(amount_pct)
 
     swap_command = [
-        "mp",
-        "token",
-        "swap",
-        "--chain", "solana",
-        "--from-token", from_token,
-        "--to-token", to_token,
-        "--from-amount", amount,
-        "--wallet", MOONPAY_WALLET,
-        "--confirm"
+    "mp",
+    "token",
+    "swap",
+    "--chain", "solana",
+    "--from-token", from_token,
+    "--to-token", to_token,
+    "--from-amount", amount,
+    "--wallet", MOONPAY_WALLET
     ]
 
     print("Executing:", " ".join(swap_command))
