@@ -8,9 +8,9 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solana.rpc.api import Client
 from solana.transaction import Transaction
-from jupiter_python_sdk.jupiter import Jupiter  # We'll add this library
+from jupiter_python_sdk.jupiter import Jupiter  
 
-# CONFIG
+
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 if not BIRDEYE_API_KEY:
     print("ERROR: No Birdeye key!")
@@ -18,19 +18,19 @@ if not BIRDEYE_API_KEY:
 
 TOKEN_ADDRESS = Pubkey.from_string("Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk")
 USDC_MINT = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-CHECK_INTERVAL_MIN = 5  # Start slower to be safe
+CHECK_INTERVAL_MIN = 1
 RSI_PERIOD = 14
 YELLOW_MA_PERIOD = 9
 STOP_LOSS_PCT = 0.05
 POSITION_SIZE_PCT = 0.30
 STATE_FILE = "useless_agent_state.json"
 
-# Load private key from env (base58 string)
+
 private_key_str = os.getenv("SOLANA_PRIVATE_KEY")
 if private_key_str:
     keypair = Keypair.from_base58_string(private_key_str)
 else:
-    # If using seed phrase instead
+    
     seed_phrase = os.getenv("SOLANA_SEED_PHRASE")
     if seed_phrase:
         from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
@@ -42,10 +42,10 @@ else:
         print("ERROR: No SOLANA_PRIVATE_KEY or SOLANA_SEED_PHRASE in Variables!")
         exit(1)
 
-# Solana connection
+
 rpc_client = Client("https://api.mainnet-beta.solana.com")
 
-# Jupiter swap client
+
 jupiter = Jupiter(rpc_client)
 
 HEADERS = {"accept": "application/json", "x-chain": "solana", "X-API-KEY": BIRDEYE_API_KEY}
@@ -61,7 +61,7 @@ def save_state(state):
         json.dump(state, f)
 
 def get_historical_prices():
-    # Your original function - keep it
+    
     now_unix = int(time.time())
     from_unix = now_unix - (3600 * 24 * 2)
     url = f"https://public-api.birdeye.so/defi/history_price?address={str(TOKEN_ADDRESS)}&address_type=token&type=15m&time_from={from_unix}&time_to={now_unix}&ui_amount_mode=raw"
@@ -163,18 +163,18 @@ def get_current_price():
         raise ValueError("Birdeye price error")
     return float(data["data"]["value"])
 
-def import base64  # Add this import at the top of the file if not there
+
 
 def execute_swap(from_mint, to_mint, amount):
     print(f"Trying to swap {amount} from {from_mint} to {to_mint}")
 
-    # Step 1: Get quote
+    
     quote_url = "https://quote-api.jup.ag/v6/quote"
     params = {
         "inputMint": str(from_mint),
         "outputMint": str(to_mint),
-        "amount": int(amount * 1_000_000),  # USDC = 6 decimals; BONK usually 5 — adjust if needed
-        "slippageBps": 50  # 0.5% max slippage
+        "amount": int(amount * 1_000_000),  
+        "slippageBps": 50  
     }
 
     try:
@@ -185,13 +185,13 @@ def execute_swap(from_mint, to_mint, amount):
         print(f"Quote failed: {e}")
         return False
 
-    # Step 2: Get serialized swap transaction
+    
     swap_url = "https://quote-api.jup.ag/v6/swap"
     payload = {
         "quoteResponse": quote,
         "userPublicKey": str(keypair.pubkey()),
         "wrapAndUnwrapSol": True,
-        "computeUnitPriceMicroLamports": 100000  # priority fee, optional
+        "computeUnitPriceMicroLamports": 100000  
     }
 
     try:
@@ -203,7 +203,7 @@ def execute_swap(from_mint, to_mint, amount):
         print(f"Swap tx request failed: {e}")
         return False
 
-    # Step 3: Sign and send
+   
     try:
         tx = Transaction.deserialize(tx_bytes)
         tx.sign([keypair])
@@ -213,7 +213,7 @@ def execute_swap(from_mint, to_mint, amount):
     except Exception as e:
         print(f"Transaction failed: {e}")
         return False
-# MAIN LOOP
+
 state = load_state()
 print(f"[{datetime.now()}] Useless Coin Crossover Agent STARTED (Phantom Wallet Only)")
 
@@ -236,7 +236,7 @@ while True:
         if state["position"] == str(TOKEN_ADDRESS) and state["entry_price"] is not None:
             if current_price <= state["entry_price"] * (1 - STOP_LOSS_PCT):
                 print(f"STOP-LOSS TRIGGERED at {current_price}")
-                if execute_swap(TOKEN_ADDRESS, USDC_MINT, 1.0):  # sell all
+                if execute_swap(TOKEN_ADDRESS, USDC_MINT, 1.0):  
                     state["position"] = "USDC"
                     state["entry_price"] = None
                     save_state(state)
