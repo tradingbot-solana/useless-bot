@@ -2,6 +2,7 @@ import requests
 import time
 import json
 import os
+import base64
 from datetime import datetime
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
