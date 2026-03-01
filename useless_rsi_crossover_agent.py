@@ -96,34 +96,30 @@ def get_current_price():
         raise ValueError("Birdeye price error")
     return float(data["data"]["value"])
 
-def import subprocess  # Make sure this is already imported at the top; if not, add it
+def import subprocess
 
-# ... your other code above ...
-
-# Inside your buy/trade function or if-condition:
 print("[LONG CROSSOVER detected → Buying]")
 
-# Define the Moonpay CLI command with correct flags
 swap_command = [
     "mp",
     "token",
     "swap",
     "--chain", "solana",
-    "--from-token", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC mint on Solana
-    "--to-token", TOKEN_ADDRESS,  # Your BONK address: "Dz9mQ9NzkBcCs...bonk"
-    "--from-amount", "0.8",  # Or make dynamic: str(your_usdc_balance * POSITION_SIZE_PCT)
-    "--wallet", MOONPAY_WALLET,  # "useless-trader"
+    "--from-token", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "--to-token", TOKEN_ADDRESS,
+    "--from-amount", "0.8",
+    "--wallet", MOONPAY_WALLET,
     "--confirm"
 ]
 
-print("Executing:", " ".join(swap_command))  # Log the full command for debugging
+print("Executing:", " ".join(swap_command))
 
 try:
     result = subprocess.run(
         swap_command,
         capture_output=True,
         text=True,
-        check=False  # Don't raise exception on non-zero exit
+        check=False
     )
     
     print("Moonpay CLI stdout:", result.stdout.strip())
@@ -131,15 +127,14 @@ try:
     
     if result.returncode == 0:
         print("Swap SUCCESS! Transaction completed.")
-        # Optional: Add Telegram alert here if you have it set up
+    
     else:
         print(f"Swap FAILED with exit code {result.returncode}")
-        # Optional: Telegram alert on failure
+    
 
 except Exception as e:
     print("Error running Moonpay CLI command:", str(e))
 
-# ============== MAIN LOOP ==============
 state = load_state()
 print(f"[{datetime.now()}] Useless Coin Crossover Agent STARTED (Birdeye + MoonPay CLI)")
 
