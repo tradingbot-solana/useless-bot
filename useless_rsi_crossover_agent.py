@@ -126,7 +126,7 @@ def get_token_balance(token_mint: Pubkey) -> int:
     return int(bal.value.amount) if bal.value else 0
 
 # ────────────────────────────────────────────────
-# SWAP EXECUTION – FIXED VERSION (NO invalid params)
+# SWAP EXECUTION – FIXED SIGNING
 # ────────────────────────────────────────────────
 
 def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
@@ -158,7 +158,6 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
                 "outputMint": str(to_mint),
                 "amount": amount_lamports,
                 "slippageBps": slippage_bps,
-                # Removed asLegacyTransaction and maxAccounts – these caused 400
             }
 
             q = requests.get(f"{JUP_BASE}/quote", params=params, headers=JUPITER_HEADERS, timeout=15)
@@ -188,8 +187,9 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
                 print(f"Tx too short: {len(tx_bytes)} bytes")
                 continue
 
-            tx = VersionedTransaction.from_bytes(tx_bytes)
-            tx = tx.sign([keypair])
+            # FIXED: Correct signing for VersionedTransaction
+            unsigned_tx = VersionedTransaction.from_bytes(tx_bytes)
+            tx = VersionedTransaction(unsigned_tx.message, [keypair])  # Re-create with signer
 
             sim = rpc_client.simulate_transaction(tx)
             if sim.value.err:
@@ -214,7 +214,7 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
         except requests.exceptions.HTTPError as http_err:
             print(f"HTTP error: {http_err}")
             if 'q' in locals():
-                print("Jupiter error message:", q.text[:500])  # shows exact reason from Jupiter
+                print("Jupiter error message:", q.text[:500])
             continue
         except Exception as e:
             print(f"Attempt {attempt} error: {type(e).__name__}: {e}")
