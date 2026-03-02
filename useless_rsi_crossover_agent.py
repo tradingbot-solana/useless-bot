@@ -11,7 +11,10 @@ from solana.rpc.api import Client
 from solana.rpc.types import TokenAccountOpts
 from solana.rpc.commitment import Confirmed
 
-# ────── CONFIG ──────
+# ────────────────────────────────────────────────
+# CONFIG
+# ────────────────────────────────────────────────
+
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
 HELIUS_API_KEY  = os.getenv("HELIUS_API_KEY")
@@ -50,7 +53,10 @@ BIRDEYE_HEADERS = {"accept": "application/json", "x-chain": "solana", "X-API-KEY
 JUPITER_HEADERS = {"x-api-key": JUPITER_API_KEY, "Content-Type": "application/json"}
 JUP_BASE = "https://api.jup.ag/swap/v1"
 
-# ────── STATE ──────
+# ────────────────────────────────────────────────
+# STATE MANAGEMENT
+# ────────────────────────────────────────────────
+
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
@@ -61,7 +67,10 @@ def save_state(state):
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f)
 
-# ────── DATA HELPERS ──────
+# ────────────────────────────────────────────────
+# DATA FETCHING
+# ────────────────────────────────────────────────
+
 def get_historical_prices():
     now_unix = int(time.time())
     from_unix = now_unix - (3600 * 24 * 2)
@@ -116,7 +125,10 @@ def get_token_balance(token_mint: Pubkey) -> int:
     bal = rpc_client.get_token_account_balance(ata)
     return int(bal.value.amount) if bal.value else 0
 
-# ────── SWAP (the fixed part that stops the weird errors) ──────
+# ────────────────────────────────────────────────
+# SWAP EXECUTION – FIXED VERSION (NO invalid params)
+# ────────────────────────────────────────────────
+
 def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
     print(f"Trying swap: {from_mint} → {to_mint}")
     is_buy = from_mint == USDC_MINT
@@ -125,49 +137,55 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
     if is_buy:
         usdc_raw = get_token_balance(USDC_MINT)
         if usdc_raw < MIN_USDC_FOR_TRADE * 1_000_000:
-            print("Not enough USDC!")
+            print(f"Not enough USDC: {usdc_raw / 1_000_000:.4f} < {MIN_USDC_FOR_TRADE}")
             return False
         amount_ui = (usdc_raw / 1_000_000) * POSITION_SIZE_PCT
         amount_lamports = int(amount_ui * 1_000_000)
-        print(f"Buying with {amount_ui:.4f} USDC")
+        print(f"Buying with {amount_ui:.4f} USDC ({POSITION_SIZE_PCT*100}%)")
     else:
         raw = get_token_balance(from_mint)
         if raw == 0:
             print("Nothing to sell")
             return False
         amount_lamports = raw
-        print("Selling everything")
+        print(f"Selling full {raw} raw units")
 
     for attempt in range(1, 5):
-        print(f"Attempt {attempt}/4 ...")
+        print(f"Attempt {attempt}/4 (slippage {slippage_bps} bps)...")
         try:
             params = {
                 "inputMint": str(from_mint),
                 "outputMint": str(to_mint),
                 "amount": amount_lamports,
                 "slippageBps": slippage_bps,
-                "asLegacyTransaction": False,
-                "maxAccounts": 35
+                # Removed asLegacyTransaction and maxAccounts – these caused 400
             }
+
             q = requests.get(f"{JUP_BASE}/quote", params=params, headers=JUPITER_HEADERS, timeout=15)
             q.raise_for_status()
             quote = q.json()
 
-            if int(quote.get('outAmount', 0)) <= 0:
+            out_amt = int(quote.get('outAmount', 0))
+            if out_amt <= 0:
+                print("Bad quote: zero output")
                 continue
+
+            print(f"Quote good: expected out ~{out_amt / 10**6:.4f} tokens")
 
             payload = {
                 "quoteResponse": quote,
                 "userPublicKey": str(keypair.pubkey()),
                 "wrapAndUnwrapSol": True,
-                "computeUnitPriceMicroLamports": 250000
+                "computeUnitPriceMicroLamports": 250000,
             }
+
             s = requests.post(f"{JUP_BASE}/swap", json=payload, headers=JUPITER_HEADERS, timeout=15)
             s.raise_for_status()
             data = s.json()
 
             tx_bytes = base64.b64decode(data["swapTransaction"])
             if len(tx_bytes) < 200:
+                print(f"Tx too short: {len(tx_bytes)} bytes")
                 continue
 
             tx = VersionedTransaction.from_bytes(tx_bytes)
@@ -175,25 +193,41 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
 
             sim = rpc_client.simulate_transaction(tx)
             if sim.value.err:
-                if "slippage" in str(sim.value.err).lower():
+                err_str = str(sim.value.err).lower()
+                print(f"Simulation failed: {sim.value.err}")
+                if "slippage" in err_str:
                     slippage_bps = min(1000, slippage_bps + 100)
                 continue
 
+            print("Simulation passed → sending...")
+
             sig_resp = rpc_client.send_raw_transaction(tx.serialize())
             sig = sig_resp.value
+
             conf = rpc_client.confirm_transaction(sig, commitment=Confirmed)
             if conf.value:
-                print(f"✅ SWAP SUCCESS! Sig: {sig}")
+                print(f"✅ SUCCESS! Signature: {sig}")
                 return True
+            else:
+                print(f"Confirmation failed for {sig}")
+
+        except requests.exceptions.HTTPError as http_err:
+            print(f"HTTP error: {http_err}")
+            if 'q' in locals():
+                print("Jupiter error message:", q.text[:500])  # shows exact reason from Jupiter
+            continue
         except Exception as e:
-            print(f"Attempt {attempt} error: {e}")
+            print(f"Attempt {attempt} error: {type(e).__name__}: {e}")
             if attempt < 4:
                 time.sleep(3)
 
-    print("Swap failed after all tries")
+    print("All attempts failed - check balance, liquidity, or API key")
     return False
 
-# ────── MAIN ROBOT LOOP ──────
+# ────────────────────────────────────────────────
+# MAIN LOOP
+# ────────────────────────────────────────────────
+
 state = load_state()
 print(f"[{datetime.now()}] Robot STARTED with Helius super speed!")
 
