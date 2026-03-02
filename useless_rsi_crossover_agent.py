@@ -18,24 +18,24 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
 
 if not BIRDEYE_API_KEY:
-    print("ERROR: BIRDEYE_API_KEY not set!")
+    print("ERROR: BIRDEYE_API_KEY not set in environment!")
     exit(1)
 
 if not JUPITER_API_KEY:
-    print("ERROR: JUPITER_API_KEY not set! Get one at https://dev.jup.ag/portal/setup")
+    print("ERROR: JUPITER_API_KEY not set! Get one at https://portal.jup.ag")
     exit(1)
 
-TOKEN_ADDRESS = Pubkey.from_string("Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk")  # Your target token
-USDC_MINT    = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+TOKEN_ADDRESS = Pubkey.from_string("Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk")
+USDC_MINT     = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 
 CHECK_INTERVAL_MIN = 1
 RSI_PERIOD         = 14
 YELLOW_MA_PERIOD   = 9
 STOP_LOSS_PCT      = 0.05
-POSITION_SIZE_PCT  = 0.5   # fraction of USDC balance to use when buying
+POSITION_SIZE_PCT  = 50   # fraction of USDC balance to risk on buy
 STATE_FILE         = "useless_agent_state.json"
 
-# Load wallet
+# Wallet & RPC
 private_key_str = os.getenv("SOLANA_PRIVATE_KEY")
 if not private_key_str:
     print("ERROR: SOLANA_PRIVATE_KEY not set!")
@@ -50,12 +50,17 @@ BIRDEYE_HEADERS = {
     "x-chain": "solana",
     "X-API-KEY": BIRDEYE_API_KEY
 }
+
 JUPITER_HEADERS = {
     "x-api-key": JUPITER_API_KEY,
     "Content-Type": "application/json"
 }
 
 JUP_BASE = "https://api.jup.ag/swap/v1"
+
+# ────────────────────────────────────────────────
+# STATE MANAGEMENT
+# ────────────────────────────────────────────────
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -67,26 +72,30 @@ def save_state(state):
     with open(STATE_FILE, 'w') as f:
         json.dump(state, f)
 
+# ────────────────────────────────────────────────
+# DATA FETCHING
+# ────────────────────────────────────────────────
+
 def get_historical_prices():
     now_unix = int(time.time())
-    from_unix = now_unix - (3600 * 24 * 2)  # 2 days
+    from_unix = now_unix - (3600 * 24 * 2)  # last 2 days
     url = f"https://public-api.birdeye.so/defi/history_price?address={str(TOKEN_ADDRESS)}&address_type=token&type=15m&time_from={from_unix}&time_to={now_unix}&ui_amount_mode=raw"
     resp = requests.get(url, headers=BIRDEYE_HEADERS)
     resp.raise_for_status()
     data = resp.json()
     if not data.get("success"):
-        raise ValueError(f"Birdeye history error: {data}")
+        raise ValueError(f"Birdeye history failed: {data.get('message')}")
     items = data["data"]["items"]
     closes = [item["value"] for item in items]
-    return closes[::-1]  # oldest → newest
+    return closes[::-1]  # oldest to newest
 
 def calculate_rsi_and_ma(closes):
     if len(closes) < RSI_PERIOD + YELLOW_MA_PERIOD + 5:
         return None, None, None
 
     deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
+    gains = [max(d, 0) for d in deltas]
+    losses = [max(-d, 0) for d in deltas]
 
     avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
     avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
@@ -110,9 +119,7 @@ def calculate_rsi_and_ma(closes):
     current_rsi = rsi[-1]
     prev_rsi = rsi[-2] if len(rsi) > 1 else current_rsi
 
-    yellow_ma = None
-    if len(rsi) >= YELLOW_MA_PERIOD:
-        yellow_ma = sum(rsi[-YELLOW_MA_PERIOD:]) / YELLOW_MA_PERIOD
+    yellow_ma = sum(rsi[-YELLOW_MA_PERIOD:]) / YELLOW_MA_PERIOD if len(rsi) >= YELLOW_MA_PERIOD else None
 
     return current_rsi, prev_rsi, yellow_ma
 
@@ -122,37 +129,37 @@ def get_current_price():
     resp.raise_for_status()
     data = resp.json()
     if not data.get("success"):
-        raise ValueError(f"Birdeye price error: {data}")
+        raise ValueError(f"Birdeye price failed: {data.get('message')}")
     return float(data["data"]["value"])
 
 def get_token_balance(token_mint: Pubkey) -> int:
-    """Get raw token balance (smallest units) of the associated token account"""
+    """Returns raw token balance (in smallest units)"""
     opts = TokenAccountOpts(mint=token_mint)
     resp = rpc_client.get_token_accounts_by_owner(keypair.pubkey(), opts)
     if not resp.value:
         return 0
-    # Assume first (usually only) ATA
-    ata = resp.value[0].pubkey
+    ata = resp.value[0].pubkey  # take first ATA
     bal_resp = rpc_client.get_token_account_balance(ata)
-    if bal_resp.value:
-        return int(bal_resp.value.amount)
-    return 0
+    return int(bal_resp.value.amount) if bal_resp.value else 0
 
-def execute_swap(from_mint: Pubkey, to_mint: Pubkey, ui_amount: float = None):
-    print(f"Executing swap: {from_mint} → {to_mint}")
+# ────────────────────────────────────────────────
+# SWAP EXECUTION (Jupiter v1 API)
+# ────────────────────────────────────────────────
 
-    is_buying = from_mint == USDC_MINT
+def execute_swap(from_mint: Pubkey, to_mint: Pubkey, fixed_ui_amount: float = None):
+    print(f"Trying swap: {from_mint} → {to_mint}")
 
-    if is_buying:
-        if ui_amount is None:
-            ui_amount = POSITION_SIZE_PCT  # fraction, but we need absolute USDC later
-        # For buy: amount = USDC lamports (6 decimals)
-        amount_lamports = int(ui_amount * 1_000_000)
+    is_buy = from_mint == USDC_MINT
+
+    if is_buy:
+        # For buy: use fraction of USDC (or fixed amount if provided)
+        amount_lamports = int((fixed_ui_amount or POSITION_SIZE_PCT) * 1_000_000)  # USDC has 6 decimals
+        print(f"Buying with {amount_lamports / 1_000_000:.4f} USDC")
     else:
-        # For sell: use full balance
+        # For sell: use full available balance
         raw_balance = get_token_balance(from_mint)
         if raw_balance <= 0:
-            print("No balance to sell!")
+            print("No tokens to sell!")
             return False
         amount_lamports = raw_balance
         print(f"Selling full balance: {raw_balance} raw units")
@@ -161,8 +168,7 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey, ui_amount: float = None):
         "inputMint": str(from_mint),
         "outputMint": str(to_mint),
         "amount": amount_lamports,
-        "slippageBps": 50,
-        # optional: "feeBps": 0, etc.
+        "slippageBps": 50
     }
 
     try:
@@ -170,14 +176,15 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey, ui_amount: float = None):
         quote_resp.raise_for_status()
         quote = quote_resp.json()
     except Exception as e:
-        print(f"Quote failed: {e} — {quote_resp.text if 'quote_resp' in locals() else ''}")
+        print(f"Quote failed: {e}")
+        if 'quote_resp' in locals():
+            print("Response:", quote_resp.text)
         return False
 
     payload = {
         "quoteResponse": quote,
         "userPublicKey": str(keypair.pubkey()),
-        "wrapAndUnwrapSol": True,
-        # optional: "feeAccount", "prioritizationFeeLamports", etc.
+        "wrapAndUnwrapSol": True
     }
 
     try:
@@ -186,17 +193,19 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey, ui_amount: float = None):
         swap_data = swap_resp.json()
         tx_bytes = base64.b64decode(swap_data["swapTransaction"])
     except Exception as e:
-        print(f"Swap response failed: {e} — {swap_resp.text if 'swap_resp' in locals() else ''}")
+        print(f"Swap transaction prep failed: {e}")
+        if 'swap_resp' in locals():
+            print("Response:", swap_resp.text)
         return False
 
     try:
         tx = Transaction.deserialize(tx_bytes)
         tx.sign([keypair])
         sig = rpc_client.send_transaction(tx)
-        print(f"Swap SUCCESS! Signature: {sig.value}")
+        print(f"SWAP SUCCESS! Signature: {sig.value}")
         return True
     except Exception as e:
-        print(f"Transaction failed: {e}")
+        print(f"Transaction send failed: {e}")
         return False
 
 # ────────────────────────────────────────────────
@@ -204,7 +213,7 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey, ui_amount: float = None):
 # ────────────────────────────────────────────────
 
 state = load_state()
-print(f"[{datetime.now()}] Useless Coin Crossover Agent STARTED (Phantom-compatible)")
+print(f"[{datetime.now()}] Useless Coin RSI Crossover Agent STARTED")
 
 while True:
     try:
@@ -212,7 +221,7 @@ while True:
         current_rsi, prev_rsi, yellow_ma = calculate_rsi_and_ma(closes)
 
         if current_rsi is None or yellow_ma is None:
-            print(f"Not enough data yet ({len(closes)} candles)")
+            print(f"Not enough data ({len(closes)} candles)")
             time.sleep(CHECK_INTERVAL_MIN * 60)
             continue
 
@@ -222,31 +231,34 @@ while True:
         crossover_up   = (prev_rsi <= yellow_ma) and (current_rsi > yellow_ma)
         crossover_down = (prev_rsi >= yellow_ma) and (current_rsi < yellow_ma)
 
-        in_token = state["position"] == str(TOKEN_ADDRESS)
+        holding_token = state["position"] == str(TOKEN_ADDRESS)
 
-        if in_token and state["entry_price"] is not None:
+        # Stop-loss check
+        if holding_token and state["entry_price"] is not None:
             if current_price <= state["entry_price"] * (1 - STOP_LOSS_PCT):
-                print(f"STOP-LOSS triggered at {current_price:.6f}")
+                print(f"STOP LOSS triggered at {current_price:.6f}")
                 if execute_swap(TOKEN_ADDRESS, USDC_MINT):
                     state["position"] = "USDC"
                     state["entry_price"] = None
                     save_state(state)
 
-        elif crossover_up and not in_token:
-            print("LONG CROSSOVER → Buying")
+        # Buy signal
+        elif crossover_up and not holding_token:
+            print("↑ LONG CROSSOVER → Buying")
             if execute_swap(USDC_MINT, TOKEN_ADDRESS):
                 state["position"] = str(TOKEN_ADDRESS)
                 state["entry_price"] = current_price
                 save_state(state)
 
-        elif crossover_down and in_token:
-            print("SHORT CROSSOVER → Selling")
+        # Sell signal
+        elif crossover_down and holding_token:
+            print("↓ SHORT CROSSOVER → Selling")
             if execute_swap(TOKEN_ADDRESS, USDC_MINT):
                 state["position"] = "USDC"
                 state["entry_price"] = None
                 save_state(state)
 
     except Exception as e:
-        print(f"Loop error: {e}")
+        print(f"Main loop error: {e}")
 
     time.sleep(CHECK_INTERVAL_MIN * 60)
