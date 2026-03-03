@@ -8,7 +8,7 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 from solana.rpc.api import Client
-from solana.rpc.types import TokenAccountOpts
+from solana.rpc.types import TokenAccountOpts, TxOpts
 from solana.rpc.commitment import Confirmed
 
 # ────────────────────────────────────────────────
@@ -126,7 +126,7 @@ def get_token_balance(token_mint: Pubkey) -> int:
     return int(bal.value.amount) if bal.value else 0
 
 # ────────────────────────────────────────────────
-# SWAP EXECUTION – FIXED SIGNING
+# SWAP EXECUTION
 # ────────────────────────────────────────────────
 
 def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
@@ -187,10 +187,11 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
                 print(f"Tx too short: {len(tx_bytes)} bytes")
                 continue
 
-            # FIXED: Correct signing for VersionedTransaction
+            # Deserialize and sign
             unsigned_tx = VersionedTransaction.from_bytes(tx_bytes)
-            tx = VersionedTransaction(unsigned_tx.message, [keypair])  # Re-create with signer
+            tx = VersionedTransaction(unsigned_tx.message, [keypair])
 
+            # Simulate
             sim = rpc_client.simulate_transaction(tx)
             if sim.value.err:
                 err_str = str(sim.value.err).lower()
@@ -201,9 +202,21 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
 
             print("Simulation passed → sending...")
 
-            sig_resp = rpc_client.send_raw_transaction(tx.serialize())
+            # ──── FIXED: Use bytes(tx) instead of tx.serialize() ────
+            # Also added skip_preflight + commitment options (common for bots)
+            sig_resp = rpc_client.send_raw_transaction(
+                bytes(tx),
+                opts=TxOpts(
+                    skip_preflight=True,
+                    preflight_commitment=Confirmed,
+                    max_retries=3
+                )
+            )
             sig = sig_resp.value
 
+            print(f"Transaction sent: {sig}")
+
+            # Confirm
             conf = rpc_client.confirm_transaction(sig, commitment=Confirmed)
             if conf.value:
                 print(f"✅ SUCCESS! Signature: {sig}")
