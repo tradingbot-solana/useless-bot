@@ -35,7 +35,8 @@ USDC_MINT     = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
 CHECK_INTERVAL_MIN = 1
 RSI_PERIOD         = 14
 YELLOW_MA_PERIOD   = 9
-STOP_LOSS_PCT      = 0.05
+STOP_LOSS_PCT      = 0.05          # initial hard stop (kept as safety net)
+TRAIL_PCT          = 0.15          # trailing % from high (0.12–0.20 common; tune based on backtests/live)
 POSITION_SIZE_PCT  = 0.5
 MIN_USDC_FOR_TRADE = 2.0
 
@@ -60,8 +61,12 @@ JUP_BASE = "https://api.jup.ag/swap/v1"
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {"position": "USDC", "entry_price": None}
+            state = json.load(f)
+            # Ensure new keys exist (backward compat)
+            if "max_price" not in state:
+                state["max_price"] = None
+            return state
+    return {"position": "USDC", "entry_price": None, "max_price": None}
 
 def save_state(state):
     with open(STATE_FILE, 'w') as f:
@@ -237,7 +242,7 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
 # ────────────────────────────────────────────────
 
 state = load_state()
-print(f"[{datetime.now()}] Robot STARTED with Helius super speed!")
+print(f"[{datetime.now()}] Robot STARTED with Helius super speed! (Trailing stop: {TRAIL_PCT*100:.0f}% from high)")
 
 while True:
     try:
@@ -257,35 +262,50 @@ while True:
 
         holding_token = state["position"] == str(TOKEN_ADDRESS)
 
-        # ──── SELL CONDITIONS (both can be checked when holding) ────
+        # ──── SELL CONDITIONS (when holding) ────
         sold = False
 
         if holding_token and state["entry_price"] is not None:
+            # 1. Initial hard stop loss (safety net)
             if current_price <= state["entry_price"] * (1 - STOP_LOSS_PCT):
-                print(f"STOP LOSS triggered at {current_price:.6f} (entry {state['entry_price']:.6f})")
+                print(f"INITIAL STOP LOSS triggered at {current_price:.6f} (entry {state['entry_price']:.6f})")
                 if execute_swap(TOKEN_ADDRESS, USDC_MINT):
                     state["position"] = "USDC"
                     state["entry_price"] = None
+                    state["max_price"] = None
                     save_state(state)
                     sold = True
 
-        if holding_token and crossover_down:
-            print("↓ RSI DOWN CROSSOVER → Selling")
-            if execute_swap(TOKEN_ADDRESS, USDC_MINT):
-                state["position"] = "USDC"
-                state["entry_price"] = None
-                save_state(state)
-                sold = True
+            # 2. Trailing stop from high
+            if not sold:
+                state["max_price"] = max(state["max_price"] or 0, current_price)
+                trailing_stop_price = state["max_price"] * (1 - TRAIL_PCT)
+                print(f"  Max so far: ${state['max_price']:.6f} | Trailing stop sits at ${trailing_stop_price:.6f}")
 
-        # ──── BUY CONDITION (only when not holding) ────
+                if current_price <= trailing_stop_price:
+                    print(f"TRAILING STOP triggered at {current_price:.6f} (high {state['max_price']:.6f}, trail {TRAIL_PCT*100:.0f}%)")
+                    if execute_swap(TOKEN_ADDRESS, USDC_MINT):
+                        state["position"] = "USDC"
+                        state["entry_price"] = None
+                        state["max_price"] = None
+                        save_state(state)
+                        sold = True
+
+            # 3. RSI crossover sell
+            if not sold and crossover_down:
+                print("↓ RSI DOWN CROSSOVER → Selling")
+                if execute_swap(TOKEN_ADDRESS, USDC_MINT):
+                    state["position"] = "USDC"
+                    state["entry_price"] = None
+                    state["max_price"] = None
+                    save_state(state)
+                    sold = True
+
+        # ──── BUY CONDITION ────
         if crossover_up and not holding_token:
             print("↑ RSI UP CROSSOVER → Buying")
             if execute_swap(USDC_MINT, TOKEN_ADDRESS):
                 state["position"] = str(TOKEN_ADDRESS)
                 state["entry_price"] = current_price
-                save_state(state)
-
-    except Exception as e:
-        print(f"Oops: {e}")
-
-    time.sleep(CHECK_INTERVAL_MIN * 60)
+                state["max_price"] = current_price   # init trailing high
+                save_state(state
