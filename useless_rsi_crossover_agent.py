@@ -308,4 +308,4 @@ while True:
                 state["position"] = str(TOKEN_ADDRESS)
                 state["entry_price"] = current_price
                 state["max_price"] = current_price   # init trailing high
-                save_state(state
+                save_state(state)
