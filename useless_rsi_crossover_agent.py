@@ -187,11 +187,9 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
                 print(f"Tx too short: {len(tx_bytes)} bytes")
                 continue
 
-            # Deserialize and sign
             unsigned_tx = VersionedTransaction.from_bytes(tx_bytes)
             tx = VersionedTransaction(unsigned_tx.message, [keypair])
 
-            # Simulate
             sim = rpc_client.simulate_transaction(tx)
             if sim.value.err:
                 err_str = str(sim.value.err).lower()
@@ -202,8 +200,6 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
 
             print("Simulation passed → sending...")
 
-            # ──── FIXED: Use bytes(tx) instead of tx.serialize() ────
-            # Also added skip_preflight + commitment options (common for bots)
             sig_resp = rpc_client.send_raw_transaction(
                 bytes(tx),
                 opts=TxOpts(
@@ -216,7 +212,6 @@ def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
 
             print(f"Transaction sent: {sig}")
 
-            # Confirm
             conf = rpc_client.confirm_transaction(sig, commitment=Confirmed)
             if conf.value:
                 print(f"✅ SUCCESS! Signature: {sig}")
@@ -262,26 +257,32 @@ while True:
 
         holding_token = state["position"] == str(TOKEN_ADDRESS)
 
+        # ──── SELL CONDITIONS (both can be checked when holding) ────
+        sold = False
+
         if holding_token and state["entry_price"] is not None:
             if current_price <= state["entry_price"] * (1 - STOP_LOSS_PCT):
-                print(f"STOP LOSS at {current_price:.6f}")
+                print(f"STOP LOSS triggered at {current_price:.6f} (entry {state['entry_price']:.6f})")
                 if execute_swap(TOKEN_ADDRESS, USDC_MINT):
                     state["position"] = "USDC"
                     state["entry_price"] = None
                     save_state(state)
+                    sold = True
 
-        elif crossover_up and not holding_token:
-            print("↑ LONG CROSSOVER → Buying")
-            if execute_swap(USDC_MINT, TOKEN_ADDRESS):
-                state["position"] = str(TOKEN_ADDRESS)
-                state["entry_price"] = current_price
-                save_state(state)
-
-        elif crossover_down and holding_token:
-            print("↓ SHORT CROSSOVER → Selling")
+        if holding_token and crossover_down:
+            print("↓ RSI DOWN CROSSOVER → Selling")
             if execute_swap(TOKEN_ADDRESS, USDC_MINT):
                 state["position"] = "USDC"
                 state["entry_price"] = None
+                save_state(state)
+                sold = True
+
+        # ──── BUY CONDITION (only when not holding) ────
+        if crossover_up and not holding_token:
+            print("↑ RSI UP CROSSOVER → Buying")
+            if execute_swap(USDC_MINT, TOKEN_ADDRESS):
+                state["position"] = str(TOKEN_ADDRESS)
+                state["entry_price"] = current_price
                 save_state(state)
 
     except Exception as e:
