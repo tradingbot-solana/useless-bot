@@ -82,4 +82,234 @@ def get_historical_prices():
     resp = requests.get(url, headers=BIRDEYE_HEADERS)
     resp.raise_for_status()
     data = resp.json()
-    if not data.get
+    if not data.get("success"):
+        raise ValueError("Birdeye history error")
+    return [item["value"] for item in data["data"]["items"]][::-1]
+
+def calculate_rsi_and_ma(closes):
+    if len(closes) < RSI_PERIOD + YELLOW_MA_PERIOD + 5:
+        return None, None, None
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [max(d, 0) for d in deltas]
+    losses = [max(-d, 0) for d in deltas]
+    avg_gain = sum(gains[:RSI_PERIOD]) / RSI_PERIOD
+    avg_loss = sum(losses[:RSI_PERIOD]) / RSI_PERIOD
+    rsi = []
+    if avg_loss == 0:
+        rsi.append(100.0)
+    else:
+        rsi.append(100 - (100 / (1 + avg_gain / avg_loss)))
+    for i in range(RSI_PERIOD, len(gains)):
+        avg_gain = (avg_gain * (RSI_PERIOD - 1) + gains[i]) / RSI_PERIOD
+        avg_loss = (avg_loss * (RSI_PERIOD - 1) + losses[i]) / RSI_PERIOD
+        if avg_loss == 0:
+            rsi.append(100.0)
+        else:
+            rsi.append(100 - (100 / (1 + avg_gain / avg_loss)))
+    current_rsi = rsi[-1]
+    prev_rsi = rsi[-2] if len(rsi) > 1 else current_rsi
+    yellow_ma = sum(rsi[-YELLOW_MA_PERIOD:]) / YELLOW_MA_PERIOD if len(rsi) >= YELLOW_MA_PERIOD else None
+    return current_rsi, prev_rsi, yellow_ma
+
+def get_current_price():
+    url = f"https://public-api.birdeye.so/defi/price?address={str(TOKEN_ADDRESS)}"
+    resp = requests.get(url, headers=BIRDEYE_HEADERS)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success"):
+        raise ValueError("Birdeye price error")
+    return float(data["data"]["value"])
+
+def get_token_balance(token_mint: Pubkey) -> int:
+    opts = TokenAccountOpts(mint=token_mint)
+    resp = rpc_client.get_token_accounts_by_owner(keypair.pubkey(), opts)
+    if not resp.value:
+        return 0
+    ata = resp.value[0].pubkey
+    bal = rpc_client.get_token_account_balance(ata)
+    return int(bal.value.amount) if bal.value else 0
+
+# ────────────────────────────────────────────────
+# SWAP EXECUTION
+# ────────────────────────────────────────────────
+
+def execute_swap(from_mint: Pubkey, to_mint: Pubkey):
+    print(f"Trying swap: {from_mint} → {to_mint}")
+    is_buy = from_mint == USDC_MINT
+    slippage_bps = 50
+
+    if is_buy:
+        usdc_raw = get_token_balance(USDC_MINT)
+        if usdc_raw < MIN_USDC_FOR_TRADE * 1_000_000:
+            print(f"Not enough USDC: {usdc_raw / 1_000_000:.4f} < {MIN_USDC_FOR_TRADE}")
+            return False
+        amount_ui = (usdc_raw / 1_000_000) * POSITION_SIZE_PCT
+        amount_lamports = int(amount_ui * 1_000_000)
+        print(f"Buying with {amount_ui:.4f} USDC ({POSITION_SIZE_PCT*100}%)")
+    else:
+        raw = get_token_balance(from_mint)
+        if raw == 0:
+            print("Nothing to sell")
+            return False
+        amount_lamports = raw
+        print(f"Selling full {raw} raw units")
+
+    for attempt in range(1, 5):
+        print(f"Attempt {attempt}/4 (slippage {slippage_bps} bps)...")
+        try:
+            params = {
+                "inputMint": str(from_mint),
+                "outputMint": str(to_mint),
+                "amount": amount_lamports,
+                "slippageBps": slippage_bps,
+            }
+
+            q = requests.get(f"{JUP_BASE}/quote", params=params, headers=JUPITER_HEADERS, timeout=15)
+            q.raise_for_status()
+            quote = q.json()
+
+            out_amt = int(quote.get('outAmount', 0))
+            if out_amt <= 0:
+                print("Bad quote: zero output")
+                continue
+
+            print(f"Quote good: expected out ~{out_amt / 10**6:.4f} tokens")
+
+            payload = {
+                "quoteResponse": quote,
+                "userPublicKey": str(keypair.pubkey()),
+                "wrapAndUnwrapSol": True,
+                "computeUnitPriceMicroLamports": 250000,
+            }
+
+            s = requests.post(f"{JUP_BASE}/swap", json=payload, headers=JUPITER_HEADERS, timeout=15)
+            s.raise_for_status()
+            data = s.json()
+
+            tx_bytes = base64.b64decode(data["swapTransaction"])
+            if len(tx_bytes) < 200:
+                print(f"Tx too short: {len(tx_bytes)} bytes")
+                continue
+
+            unsigned_tx = VersionedTransaction.from_bytes(tx_bytes)
+            tx = VersionedTransaction(unsigned_tx.message, [keypair])
+
+            sim = rpc_client.simulate_transaction(tx)
+            if sim.value.err:
+                err_str = str(sim.value.err).lower()
+                print(f"Simulation failed: {sim.value.err}")
+                if "slippage" in err_str:
+                    slippage_bps = min(1000, slippage_bps + 100)
+                continue
+
+            print("Simulation passed → sending...")
+
+            sig_resp = rpc_client.send_raw_transaction(
+                bytes(tx),
+                opts=TxOpts(
+                    skip_preflight=True,
+                    preflight_commitment=Confirmed,
+                    max_retries=3
+                )
+            )
+            sig = sig_resp.value
+
+            print(f"Transaction sent: {sig}")
+
+            conf = rpc_client.confirm_transaction(sig, commitment=Confirmed)
+            if conf.value:
+                print(f"✅ SUCCESS! Signature: {sig}")
+                return True
+            else:
+                print(f"Confirmation failed for {sig}")
+
+        except requests.exceptions.HTTPError as http_err:
+            print(f"HTTP error: {http_err}")
+            if 'q' in locals():
+                print("Jupiter error message:", q.text[:500])
+            continue
+        except Exception as e:
+            print(f"Attempt {attempt} error: {type(e).__name__}: {e}")
+            if attempt < 4:
+                time.sleep(3)
+
+    print("All attempts failed - check balance, liquidity, or API key")
+    return False
+
+# ────────────────────────────────────────────────
+# MAIN LOOP
+# ────────────────────────────────────────────────
+
+state = load_state()
+print(f"[{datetime.now()}] Robot STARTED with Helius super speed! (Trailing stop: {TRAIL_PCT*100:.0f}% from high)")
+
+while True:
+    try:
+        closes = get_historical_prices()
+        current_rsi, prev_rsi, yellow_ma = calculate_rsi_and_ma(closes)
+
+        if current_rsi is None or yellow_ma is None:
+            print(f"Not enough data yet ({len(closes)} candles)")
+            time.sleep(CHECK_INTERVAL_MIN * 60)
+            continue
+
+        current_price = get_current_price()
+        print(f"[{datetime.now()}] Price: ${current_price:.6f} | RSI: {current_rsi:.2f} | Yellow MA: {yellow_ma:.2f}")
+
+        crossover_up   = (prev_rsi <= yellow_ma) and (current_rsi > yellow_ma)
+        crossover_down = (prev_rsi >= yellow_ma) and (current_rsi < yellow_ma)
+
+        holding_token = state["position"] == str(TOKEN_ADDRESS)
+
+        # ──── SELL CONDITIONS (when holding) ────
+        sold = False
+
+        if holding_token and state["entry_price"] is not None:
+            # 1. Initial hard stop loss (safety net)
+            if current_price <= state["entry_price"] * (1 - STOP_LOSS_PCT):
+                print(f"INITIAL STOP LOSS triggered at {current_price:.6f} (entry {state['entry_price']:.6f})")
+                if execute_swap(TOKEN_ADDRESS, USDC_MINT):
+                    state["position"] = "USDC"
+                    state["entry_price"] = None
+                    state["max_price"] = None
+                    save_state(state)
+                    sold = True
+
+            # 2. Trailing stop from high
+            if not sold:
+                state["max_price"] = max(state["max_price"] or 0, current_price)
+                trailing_stop_price = state["max_price"] * (1 - TRAIL_PCT)
+                print(f"  Max so far: ${state['max_price']:.6f} | Trailing stop sits at ${trailing_stop_price:.6f}")
+
+                if current_price <= trailing_stop_price:
+                    print(f"TRAILING STOP triggered at {current_price:.6f} (high {state['max_price']:.6f}, trail {TRAIL_PCT*100:.0f}%)")
+                    if execute_swap(TOKEN_ADDRESS, USDC_MINT):
+                        state["position"] = "USDC"
+                        state["entry_price"] = None
+                        state["max_price"] = None
+                        save_state(state)
+                        sold = True
+
+            # 3. RSI crossover sell
+            if not sold and crossover_down:
+                print("↓ RSI DOWN CROSSOVER → Selling")
+                if execute_swap(TOKEN_ADDRESS, USDC_MINT):
+                    state["position"] = "USDC"
+                    state["entry_price"] = None
+                    state["max_price"] = None
+                    save_state(state)
+                    sold = True
+
+        # ──── BUY CONDITION ────
+        if crossover_up and not holding_token:
+            print("↑ RSI UP CROSSOVER → Buying")
+            if execute_swap(USDC_MINT, TOKEN_ADDRESS):
+                state["position"] = str(TOKEN_ADDRESS)
+                state["entry_price"] = current_price
+                state["max_price"] = current_price   # init trailing high
+                save_state(state)
+
+    except Exception as e:
+        print(f"Oops: {e}")
+
+    time.sleep(CHECK_INTERVAL_MIN * 60)
