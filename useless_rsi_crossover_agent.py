@@ -32,11 +32,12 @@ if not HELIUS_API_KEY:
 TOKEN_ADDRESS = Pubkey.from_string("Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk")
 USDC_MINT     = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 
-CHECK_INTERVAL_MIN = 1
-RSI_PERIOD         = 14
-YELLOW_MA_PERIOD   = 9
+CHECK_INTERVAL_MIN = 1  # Keep at 1min; sufficient to catch 5min candle updates
+RSI_PERIOD         = 10  # Shortened for faster signals
+YELLOW_MA_PERIOD   = 5   # Shortened for less lag
+EMA_PERIOD         = 50  # For trend filter
 STOP_LOSS_PCT      = 0.05          # initial hard stop (safety net)
-TRAIL_PCT          = 0.15          # trailing % from high (tune: 0.12 tight, 0.18–0.20 loose)
+TRAIL_PCT          = 0.12          # Tightened for quicker profit lock in pumps (was 0.15)
 POSITION_SIZE_PCT  = 0.5
 MIN_USDC_FOR_TRADE = 2.0
 
@@ -77,8 +78,8 @@ def save_state(state):
 
 def get_historical_prices():
     now_unix = int(time.time())
-    from_unix = now_unix - (3600 * 24 * 2)
-    url = f"https://public-api.birdeye.so/defi/history_price?address={str(TOKEN_ADDRESS)}&address_type=token&type=15m&time_from={from_unix}&time_to={now_unix}&ui_amount_mode=raw"
+    from_unix = now_unix - (3600 * 24 * 7)  # 7 days back for more 5min data (~2016 candles)
+    url = f"https://public-api.birdeye.so/defi/history_price?address={str(TOKEN_ADDRESS)}&address_type=token&type=5m&time_from={from_unix}&time_to={now_unix}&ui_amount_mode=raw"
     resp = requests.get(url, headers=BIRDEYE_HEADERS)
     resp.raise_for_status()
     data = resp.json()
@@ -110,6 +111,15 @@ def calculate_rsi_and_ma(closes):
     prev_rsi = rsi[-2] if len(rsi) > 1 else current_rsi
     yellow_ma = sum(rsi[-YELLOW_MA_PERIOD:]) / YELLOW_MA_PERIOD if len(rsi) >= YELLOW_MA_PERIOD else None
     return current_rsi, prev_rsi, yellow_ma
+
+def calculate_ema(closes, period):
+    if len(closes) < period:
+        return None
+    alpha = 2 / (period + 1)
+    ema = sum(closes[:period]) / period  # Initial SMA
+    for price in closes[period:]:
+        ema = price * alpha + ema * (1 - alpha)
+    return ema
 
 def get_current_price():
     url = f"https://public-api.birdeye.so/defi/price?address={str(TOKEN_ADDRESS)}"
@@ -253,8 +263,14 @@ while True:
             time.sleep(CHECK_INTERVAL_MIN * 60)
             continue
 
+        ema50 = calculate_ema(closes, EMA_PERIOD)
+        if ema50 is None:
+            print(f"Not enough data for EMA50 ({len(closes)} candles)")
+            time.sleep(CHECK_INTERVAL_MIN * 60)
+            continue
+
         current_price = get_current_price()
-        print(f"[{datetime.now()}] Price: ${current_price:.6f} | RSI: {current_rsi:.2f} | Yellow MA: {yellow_ma:.2f}")
+        print(f"[{datetime.now()}] Price: ${current_price:.6f} | RSI: {current_rsi:.2f} | Yellow MA: {yellow_ma:.2f} | EMA50: {ema50:.6f}")
 
         crossover_up   = (prev_rsi <= yellow_ma) and (current_rsi > yellow_ma)
         crossover_down = (prev_rsi >= yellow_ma) and (current_rsi < yellow_ma)
@@ -301,8 +317,8 @@ while True:
                     sold = True
 
         # ──── BUY CONDITION ────
-        if crossover_up and not holding_token:
-            print("↑ RSI UP CROSSOVER → Buying")
+        if crossover_up and not holding_token and current_price > ema50:  # Added trend filter
+            print("↑ RSI UP CROSSOVER → Buying (price > EMA50)")
             if execute_swap(USDC_MINT, TOKEN_ADDRESS):
                 state["position"] = str(TOKEN_ADDRESS)
                 state["entry_price"] = current_price
