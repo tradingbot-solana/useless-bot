@@ -1,13 +1,14 @@
 FROM python:3.12-slim
 
-# Install Node and MoonPay CLI
-RUN apt-get update && apt-get install -y nodejs npm \
-    && npm install -g @moonpay/cli
-
 WORKDIR /app
 
-COPY . .
+RUN pip install --no-cache-dir \
+    pandas \
+    requests \
+    python-dotenv \
+    solana \
+    solders
 
-RUN pip install --no-cache-dir -r requirements.txt
+COPY uselesss_rsi_crossover_agent.py .
 
-CMD ["python", "useless_rsi_crossover_agent.py"]
+CMD ["python", "uselesss_rsi_crossover_agent.py"]
