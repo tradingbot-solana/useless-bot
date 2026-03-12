@@ -9,6 +9,6 @@ RUN pip install --no-cache-dir \
     solana \
     solders
 
-COPY uselesss_rsi_crossover_agent.py .
+COPY useless_rsi_crossover_agent.py .
 
 CMD ["python", "uselesss_rsi_crossover_agent.py"]
