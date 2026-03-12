@@ -19,25 +19,25 @@ load_dotenv()
 
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")  # If required; otherwise not used
-SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")  # Base58 private key
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")  # Optional / not always needed
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")  # Base58-encoded string
 SOLANA_PUBLIC_ADDRESS = os.getenv("SOLANA_PUBLIC_ADDRESS")
 
 # Configurable params
-TOKEN_MINT = "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk"  # Useless Coin (USELESS) mint address
-TRADE_SIZE_SOL = 0.1  # SOL amount per buy
-SLIPPAGE_BPS = 50  # 0.5%
-TIMEFRAME = "1m"  # BirdEye timeframe
-HISTORY_BARS = 200  # For indicators
+TOKEN_MINT = "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk"  # Useless Coin (USELESS)
+TRADE_SIZE_SOL = 0.1
+SLIPPAGE_BPS = 50
+TIMEFRAME = "1m"
+HISTORY_BARS = 200
 RSI_PERIOD = 14
 SMA_PERIOD = 50
 BB_PERIOD = 20
 BB_STD = 2
 RSI_BUY_THRESH = 30
 RSI_SELL_THRESH = 70
-SMA_FLAT_THRESH = 0.01  # 1% max change over last 10 bars for "flat"
-POLL_INTERVAL_SEC = 60  # For indicators
-PRICE_CHECK_SEC = 5  # For TP/SL
+SMA_FLAT_THRESH = 0.01
+POLL_INTERVAL_SEC = 60
+PRICE_CHECK_SEC = 5
 TP_PCT = 0.01
 SL_PCT = -0.01
 
@@ -51,94 +51,82 @@ LAMPORTS_PER_SOL = 1_000_000_000
 
 # Initialize Solana client and keypair
 rpc_client = Client(HELIUS_RPC_URL)
-keypair = Keypair.from_base58(SOLANA_PRIVATE_KEY)
+keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)  # FIXED HERE
 wallet_pubkey = Pubkey.from_string(SOLANA_PUBLIC_ADDRESS)
 
-# SPL Token client for balances
-token_client = Token(rpc_client, Pubkey.from_string(TOKEN_MINT), TOKEN_PROGRAM_ID, keypair)
+# SPL Token client
+token_mint_pubkey = Pubkey.from_string(TOKEN_MINT)
+token_client = Token(rpc_client, token_mint_pubkey, TOKEN_PROGRAM_ID, keypair)
 
-# Helper: Get current Unix time
+# Helper: current Unix timestamp
 def get_unix_time():
     return int(time.time())
 
-# Helper: Get historical OHLCV from BirdEye
+# Get OHLCV from BirdEye
 def get_ohlcv(address, timeframe, bars):
     time_to = get_unix_time()
-    time_from = time_to - (bars * 60)  # Assuming 1m; adjust for other
+    time_from = time_to - (bars * 60)  # rough for 1m
     url = f"{BIRDEYE_BASE_URL}/defi/ohlcv"
     params = {
         "address": address,
         "type": timeframe,
         "time_from": time_from,
         "time_to": time_to,
-        "currency": "usd",  # Or "sol" if preferred
+        "currency": "usd",
         "ui_amount_mode": "raw"
     }
-    headers = {
-        "x-api-key": BIRDEYE_API_KEY,
-        "x-chain": "solana"
-    }
-    response = requests.get(url, params=params, headers=headers)
-    if response.status_code == 200:
-        items = response.json()["data"]["items"]
-        df = pd.DataFrame(items)[["unixTime", "open", "high", "low", "close", "volume"]]
-        df["unixTime"] = pd.to_datetime(df["unixTime"], unit="s")
-        return df
-    else:
-        raise Exception(f"BirdEye OHLCV error: {response.text}")
+    headers = {"x-api-key": BIRDEYE_API_KEY, "x-chain": "solana"}
+    resp = requests.get(url, params=params, headers=headers)
+    resp.raise_for_status()
+    items = resp.json()["data"]["items"]
+    df = pd.DataFrame(items)[["unixTime", "open", "high", "low", "close", "volume"]]
+    df["unixTime"] = pd.to_datetime(df["unixTime"], unit="s")
+    return df
 
-# Helper: Get current price from BirdEye
+# Current price from BirdEye
 def get_current_price(address):
     url = f"{BIRDEYE_BASE_URL}/defi/price"
     params = {"address": address}
-    headers = {
-        "x-api-key": BIRDEYE_API_KEY,
-        "x-chain": "solana"
-    }
-    response = requests.get(url, params=params, headers=headers)
-    if response.status_code == 200:
-        return response.json()["data"]["value"]
-    else:
-        raise Exception(f"BirdEye price error: {response.text}")
+    headers = {"x-api-key": BIRDEYE_API_KEY, "x-chain": "solana"}
+    resp = requests.get(url, params=params, headers=headers)
+    resp.raise_for_status()
+    return resp.json()["data"]["value"]
 
-# Helper: Compute indicators
+# Compute indicators
 def compute_indicators(df):
     closes = df["close"]
-    # SMA
     df["sma"] = closes.rolling(window=SMA_PERIOD).mean()
-    # RSI
     delta = closes.diff()
     gain = delta.where(delta > 0, 0).rolling(window=RSI_PERIOD).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
     rs = gain / loss
     df["rsi"] = 100 - (100 / (1 + rs))
-    # Bollinger Bands
     df["bb_middle"] = closes.rolling(window=BB_PERIOD).mean()
     std = closes.rolling(window=BB_PERIOD).std()
     df["bb_upper"] = df["bb_middle"] + (BB_STD * std)
     df["bb_lower"] = df["bb_middle"] - (BB_STD * std)
     return df
 
-# Helper: Check if SMA is flat (for ranging confirmation)
+# SMA flat check (ranging filter)
 def is_sma_flat(df):
     recent_sma = df["sma"].iloc[-10:]
     pct_change = (recent_sma.max() - recent_sma.min()) / recent_sma.min()
     return pct_change < SMA_FLAT_THRESH
 
-# Helper: Get token balance
+# Token balance (with decimals handling)
 def get_token_balance():
     try:
-        account = token_client.get_account(wallet_pubkey)
-        mint = token_client.get_mint(Pubkey.from_string(TOKEN_MINT))
-        return account.amount / (10 ** mint.decimals)
+        mint_info = token_client.get_mint(token_mint_pubkey)
+        decimals = mint_info.decimals
+        balance_resp = token_client.get_balance(wallet_pubkey)
+        return balance_resp.value.ui_amount or 0.0
     except:
-        return 0  # No account or balance
+        return 0.0
 
-# Helper: Execute swap (buy or sell)
+# Execute Jupiter swap
 def execute_swap(is_buy, amount_lamports):
     input_mint = SOL_MINT if is_buy else TOKEN_MINT
     output_mint = TOKEN_MINT if is_buy else SOL_MINT
-    # Get quote
     quote_params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -146,8 +134,7 @@ def execute_swap(is_buy, amount_lamports):
         "slippageBps": SLIPPAGE_BPS
     }
     quote_resp = requests.get(JUPITER_QUOTE_URL, params=quote_params).json()
-    
-    # Prepare swap request
+
     swap_body = {
         "quoteResponse": quote_resp,
         "userPublicKey": str(wallet_pubkey),
@@ -157,28 +144,30 @@ def execute_swap(is_buy, amount_lamports):
     }
     swap_resp = requests.post(JUPITER_SWAP_URL, json=swap_body).json()
     swap_tx_b64 = swap_resp["swapTransaction"]
-    
-    # Deserialize, sign, send
+
     tx_bytes = base64.b64decode(swap_tx_b64)
     tx = VersionedTransaction.from_bytes(tx_bytes)
     tx.sign([keypair])
     sig = rpc_client.send_transaction(tx, opts=TxOpts(skip_preflight=True)).value
     return sig
 
-# Helper: Confirm transaction
+# Confirm tx
 def confirm_tx(sig):
     while True:
         status = rpc_client.get_signature_statuses([sig]).value[0]
-        if status and status.confirmation_status == "confirmed":
+        if status and status.confirmation_status in ("processed", "confirmed", "finalized"):
             return True
         time.sleep(1)
 
-# Main bot loop
+# ────────────────────────────────────────────────
+# Main loop
+# ────────────────────────────────────────────────
+
 position = False
 entry_price = None
+
 while True:
     try:
-        # Fetch data and compute indicators
         df = get_ohlcv(TOKEN_MINT, TIMEFRAME, HISTORY_BARS)
         df = compute_indicators(df)
         current_price = get_current_price(TOKEN_MINT)
@@ -186,61 +175,60 @@ while True:
         last_rsi = df["rsi"].iloc[-1]
         last_bb_lower = df["bb_lower"].iloc[-1]
         last_bb_upper = df["bb_upper"].iloc[-1]
-        
-        # Check for ranging
+
         if not is_sma_flat(df):
-            print("Market not ranging; skipping.")
+            print("Market not ranging → skip")
             time.sleep(POLL_INTERVAL_SEC)
             continue
-        
-        # Position check
+
         token_bal = get_token_balance()
-        position = token_bal > 0.000001  # Threshold for dust
-        
+        position = token_bal > 0.000001  # dust threshold
+
         if not position:
             # Buy signal
             if last_rsi < RSI_BUY_THRESH and last_close < last_bb_lower:
-                print(f"Buy signal at {current_price}")
+                print(f"BUY signal @ {current_price:.6f}")
                 amount_lamports = int(TRADE_SIZE_SOL * LAMPORTS_PER_SOL)
                 sig = execute_swap(True, amount_lamports)
                 if confirm_tx(sig):
-                    entry_price = current_price  # Approximate; improve with filled amount
+                    entry_price = current_price  # approx — in production get real fill price
                     position = True
-                    print(f"Bought at ~{entry_price}")
+                    print(f"Buy executed ≈ {entry_price:.6f}")
         else:
-            # Sell signal or TP/SL
+            # Sell logic (indicators or TP/SL)
             pct_change = (current_price - entry_price) / entry_price
-            if last_rsi > RSI_SELL_THRESH or last_close > last_bb_upper or pct_change >= TP_PCT or pct_change <= SL_PCT:
-                print(f"Sell signal at {current_price} (pct: {pct_change:.2%})")
-                # Sell all
-                token_bal = get_token_balance()
-                mint = token_client.get_mint(Pubkey.from_string(TOKEN_MINT))
-                amount_lamports = int(token_bal * (10 ** mint.decimals))
-                sig = execute_swap(False, amount_lamports)
+            if (last_rsi > RSI_SELL_THRESH or
+                last_close > last_bb_upper or
+                pct_change >= TP_PCT or
+                pct_change <= SL_PCT):
+                print(f"SELL signal @ {current_price:.6f} (pct: {pct_change:+.2%})")
+                mint_info = token_client.get_mint(token_mint_pubkey)
+                decimals = mint_info.decimals
+                amount_to_sell = int(token_bal * (10 ** decimals))
+                sig = execute_swap(False, amount_to_sell)
                 if confirm_tx(sig):
                     entry_price = None
                     position = False
-                    print(f"Sold at ~{current_price}")
-        
-        # Inner loop for TP/SL monitoring (while waiting for next indicator poll)
+                    print(f"Sold ≈ {current_price:.6f}")
+
+        # Tight TP/SL monitor loop
         start = time.time()
         while time.time() - start < POLL_INTERVAL_SEC:
             if position:
                 current_price = get_current_price(TOKEN_MINT)
                 pct_change = (current_price - entry_price) / entry_price
                 if pct_change >= TP_PCT or pct_change <= SL_PCT:
-                    # Trigger sell
-                    token_bal = get_token_balance()
-                    mint = token_client.get_mint(Pubkey.from_string(TOKEN_MINT))
-                    amount_lamports = int(token_bal * (10 ** mint.decimals))
-                    sig = execute_swap(False, amount_lamports)
+                    print(f"TP/SL triggered @ {current_price:.6f} (pct: {pct_change:+.2%})")
+                    mint_info = token_client.get_mint(token_mint_pubkey)
+                    decimals = mint_info.decimals
+                    amount_to_sell = int(token_bal * (10 ** decimals))
+                    sig = execute_swap(False, amount_to_sell)
                     if confirm_tx(sig):
                         entry_price = None
                         position = False
-                        print(f"TP/SL hit: Sold at ~{current_price} (pct: {pct_change:.2%})")
                     break
             time.sleep(PRICE_CHECK_SEC)
-    
+
     except Exception as e:
         print(f"Error: {e}")
-        time.sleep(60)  # Retry delay
+        time.sleep(60)
