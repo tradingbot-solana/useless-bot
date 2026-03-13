@@ -12,9 +12,10 @@ from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from spl.token.client import Token
 from spl.token.constants import TOKEN_PROGRAM_ID
+from requests.exceptions import ConnectionError, RequestException
 
 # ────────────────────────────────────────────────
-# Immediate debug prints – first thing in the script
+# Immediate debug prints
 # ────────────────────────────────────────────────
 print("DEBUG: Script file has started execution", flush=True)
 print(f"DEBUG: Python version: {sys.version}", flush=True)
@@ -37,7 +38,7 @@ print(f"DEBUG: HELIUS_API_KEY is set: {bool(HELIUS_API_KEY)}", flush=True)
 print(f"DEBUG: SOLANA_PRIVATE_KEY is set: {bool(SOLANA_PRIVATE_KEY)}", flush=True)
 print(f"DEBUG: SOLANA_PUBLIC_ADDRESS is set: {bool(SOLANA_PUBLIC_ADDRESS)}", flush=True)
 
-# Configurable params – updated values
+# Configurable params
 TOKEN_MINT = "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk"
 TRADE_SIZE_SOL = 0.1
 SLIPPAGE_BPS = 50
@@ -47,10 +48,10 @@ RSI_PERIOD = 14
 SMA_PERIOD = 50
 BB_PERIOD = 20
 BB_STD = 2.0
-RSI_BUY_THRESH = 35               # ← Change 1: loosened from 30 → 35
-SMA_FLAT_THRESH = 0.02            # ← Change 2: relaxed from 0.01 → 0.02
-SMA_LOOKBACK = 20                 # ← Change 2: widened from 10 → 20 candles
-VOLUME_MULTIPLIER = 1.5           # ← Change 4: volume filter threshold
+RSI_BUY_THRESH = 35
+SMA_FLAT_THRESH = 0.02
+SMA_LOOKBACK = 20
+VOLUME_MULTIPLIER = 1.5
 POLL_INTERVAL_SEC = 60
 PRICE_CHECK_SEC = 5
 TP_PCT = 0.01
@@ -94,9 +95,16 @@ def get_ohlcv(address, timeframe, bars):
         "ui_amount_mode": "raw"
     }
     headers = {"x-api-key": BIRDEYE_API_KEY, "x-chain": "solana"}
-    response = requests.get(url, params=params, headers=headers)
-    response.raise_for_status()
-
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            break
+        except (ConnectionError, RequestException) as e:
+            print(f"DEBUG: BirdEye OHLCV failed (attempt {attempt}/3): {str(e)}", flush=True)
+            if attempt == 3:
+                raise
+            time.sleep(5)
     data = response.json()
     if not data.get("success", False):
         raise Exception(f"BirdEye OHLCV failed: {data.get('message', data)}")
@@ -123,8 +131,16 @@ def get_current_price(address):
     url = f"{BIRDEYE_BASE_URL}/defi/price"
     params = {"address": address}
     headers = {"x-api-key": BIRDEYE_API_KEY, "x-chain": "solana"}
-    response = requests.get(url, params=params, headers=headers)
-    response.raise_for_status()
+    for attempt in range(1, 4):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            break
+        except (ConnectionError, RequestException) as e:
+            print(f"DEBUG: BirdEye price failed (attempt {attempt}/3): {str(e)}", flush=True)
+            if attempt == 3:
+                raise
+            time.sleep(5)
     data = response.json()
     if not data.get("success"):
         raise Exception(f"BirdEye price failed: {data}")
@@ -147,7 +163,7 @@ def compute_indicators(df):
     return df
 
 def is_sma_flat(df):
-    recent_sma = df["sma"].iloc[-SMA_LOOKBACK:]  # ← wider lookback
+    recent_sma = df["sma"].iloc[-SMA_LOOKBACK:]
     if len(recent_sma) < SMA_LOOKBACK:
         return False
     pct_change = (recent_sma.max() - recent_sma.min()) / recent_sma.min()
@@ -175,7 +191,15 @@ def execute_swap(is_buy, amount_lamports):
         "amount": amount_lamports,
         "slippageBps": SLIPPAGE_BPS
     }
-    quote_resp = requests.get(JUPITER_QUOTE_URL, params=quote_params).json()
+    for attempt in range(1, 4):
+        try:
+            quote_resp = requests.get(JUPITER_QUOTE_URL, params=quote_params, timeout=10).json()
+            break
+        except (ConnectionError, RequestException) as e:
+            print(f"DEBUG: Jupiter quote failed (attempt {attempt}/3): {str(e)}", flush=True)
+            if attempt == 3:
+                raise
+            time.sleep(5)
 
     swap_body = {
         "quoteResponse": quote_resp,
@@ -184,7 +208,15 @@ def execute_swap(is_buy, amount_lamports):
         "computeUnitPriceMicroLamports": "auto",
         "prioritizationFeeLamports": "auto"
     }
-    swap_resp = requests.post(JUPITER_SWAP_URL, json=swap_body).json()
+    for attempt in range(1, 4):
+        try:
+            swap_resp = requests.post(JUPITER_SWAP_URL, json=swap_body, timeout=10).json()
+            break
+        except (ConnectionError, RequestException) as e:
+            print(f"DEBUG: Jupiter swap failed (attempt {attempt}/3): {str(e)}", flush=True)
+            if attempt == 3:
+                raise
+            time.sleep(5)
     swap_tx_b64 = swap_resp["swapTransaction"]
 
     tx_bytes = base64.b64decode(swap_tx_b64)
@@ -228,7 +260,7 @@ while True:
         # Log key indicators every cycle
         print(f"[{datetime.now()}] RSI: {last_rsi:.2f} | Close: {last_close:.8f} | SMA flat: {is_sma_flat(df)} | Below BB lower: {last_close < last_bb_lower}", flush=True)
 
-        # Volume filter (only relevant for buy side)
+        # Volume filter
         avg_vol = df["volume"].rolling(20).mean().iloc[-1]
         current_vol = df["volume"].iloc[-1]
         volume_ok = current_vol > avg_vol * VOLUME_MULTIPLIER
@@ -243,7 +275,7 @@ while True:
         position = token_bal > 0.000001
 
         if not position:
-            # Buy signal: RSI OR below BB + volume confirmation
+            # Buy signal: RSI < thresh OR below BB lower, AND volume ok
             if volume_ok and (last_rsi < RSI_BUY_THRESH or last_close < last_bb_lower):
                 print(f"[{datetime.now()}] BUY signal @ {current_price:.8f} (RSI {last_rsi:.2f}, below BB: {last_close < last_bb_lower})", flush=True)
                 amount_lamports = int(TRADE_SIZE_SOL * LAMPORTS_PER_SOL)
