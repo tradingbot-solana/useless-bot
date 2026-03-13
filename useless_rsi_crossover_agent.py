@@ -37,9 +37,9 @@ print(f"DEBUG: HELIUS_API_KEY is set: {bool(HELIUS_API_KEY)}", flush=True)
 print(f"DEBUG: SOLANA_PRIVATE_KEY is set: {bool(SOLANA_PRIVATE_KEY)}", flush=True)
 print(f"DEBUG: SOLANA_PUBLIC_ADDRESS is set: {bool(SOLANA_PUBLIC_ADDRESS)}", flush=True)
 
-# Configurable params
+# Configurable params – updated values
 TOKEN_MINT = "Dz9mQ9NzkBcCsuGPFJ3r1bS4wgqKMHBPiVuniW8Mbonk"
-TRADE_SIZE_SOL = 0.5
+TRADE_SIZE_SOL = 0.1
 SLIPPAGE_BPS = 50
 TIMEFRAME = "1m"
 HISTORY_BARS = 200
@@ -47,9 +47,10 @@ RSI_PERIOD = 14
 SMA_PERIOD = 50
 BB_PERIOD = 20
 BB_STD = 2.0
-RSI_BUY_THRESH = 30
-RSI_SELL_THRESH = 70
-SMA_FLAT_THRESH = 0.01
+RSI_BUY_THRESH = 35               # ← Change 1: loosened from 30 → 35
+SMA_FLAT_THRESH = 0.02            # ← Change 2: relaxed from 0.01 → 0.02
+SMA_LOOKBACK = 20                 # ← Change 2: widened from 10 → 20 candles
+VOLUME_MULTIPLIER = 1.5           # ← Change 4: volume filter threshold
 POLL_INTERVAL_SEC = 60
 PRICE_CHECK_SEC = 5
 TP_PCT = 0.01
@@ -146,7 +147,9 @@ def compute_indicators(df):
     return df
 
 def is_sma_flat(df):
-    recent_sma = df["sma"].iloc[-10:]
+    recent_sma = df["sma"].iloc[-SMA_LOOKBACK:]  # ← wider lookback
+    if len(recent_sma) < SMA_LOOKBACK:
+        return False
     pct_change = (recent_sma.max() - recent_sma.min()) / recent_sma.min()
     return pct_change < SMA_FLAT_THRESH
 
@@ -159,7 +162,7 @@ def get_token_balance():
         print(f"DEBUG: Token balance: {bal}", flush=True)
         return bal
     except Exception:
-        print("DEBUG: No token account or balance fetch failed", flush=True)
+        print("DEBUG: No ATA exists yet for this token (normal if balance is zero)", flush=True)
         return 0.0
 
 def execute_swap(is_buy, amount_lamports):
@@ -212,7 +215,7 @@ position = False
 entry_price = None
 
 while True:
-    print(f"[{datetime.now()}] DEBUG: Main loop iteration start", flush=True)
+    print(f"[{datetime.now()}] DEBUG: Starting new poll cycle", flush=True)
     try:
         df = get_ohlcv(TOKEN_MINT, TIMEFRAME, HISTORY_BARS)
         df = compute_indicators(df)
@@ -222,8 +225,17 @@ while True:
         last_bb_lower = df["bb_lower"].iloc[-1]
         last_bb_upper = df["bb_upper"].iloc[-1]
 
+        # Log key indicators every cycle
+        print(f"[{datetime.now()}] RSI: {last_rsi:.2f} | Close: {last_close:.8f} | SMA flat: {is_sma_flat(df)} | Below BB lower: {last_close < last_bb_lower}", flush=True)
+
+        # Volume filter (only relevant for buy side)
+        avg_vol = df["volume"].rolling(20).mean().iloc[-1]
+        current_vol = df["volume"].iloc[-1]
+        volume_ok = current_vol > avg_vol * VOLUME_MULTIPLIER
+        print(f"[{datetime.now()}] Volume check: current={current_vol:.1f}, avg={avg_vol:.1f}, ok={volume_ok}", flush=True)
+
         if not is_sma_flat(df):
-            print(f"[{datetime.now()}] Market not ranging → skip", flush=True)
+            print(f"[{datetime.now()}] Market not ranging → skip (SMA change too high)", flush=True)
             time.sleep(POLL_INTERVAL_SEC)
             continue
 
@@ -231,14 +243,17 @@ while True:
         position = token_bal > 0.000001
 
         if not position:
-            if last_rsi < RSI_BUY_THRESH and last_close < last_bb_lower:
-                print(f"[{datetime.now()}] BUY signal @ {current_price:.8f}", flush=True)
+            # Buy signal: RSI OR below BB + volume confirmation
+            if volume_ok and (last_rsi < RSI_BUY_THRESH or last_close < last_bb_lower):
+                print(f"[{datetime.now()}] BUY signal @ {current_price:.8f} (RSI {last_rsi:.2f}, below BB: {last_close < last_bb_lower})", flush=True)
                 amount_lamports = int(TRADE_SIZE_SOL * LAMPORTS_PER_SOL)
                 sig = execute_swap(True, amount_lamports)
                 if confirm_tx(sig):
                     entry_price = current_price
                     position = True
                     print(f"[{datetime.now()}] Buy executed ≈ {entry_price:.8f}", flush=True)
+            else:
+                print(f"[{datetime.now()}] No buy signal (RSI {last_rsi:.2f}, below BB: {last_close < last_bb_lower}, vol ok: {volume_ok})", flush=True)
         else:
             pct_change = (current_price - entry_price) / entry_price
             if (last_rsi > RSI_SELL_THRESH or
