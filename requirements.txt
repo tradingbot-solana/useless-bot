@@ -1,4 +1,5 @@
+pandas
 requests
-solders==0.21.0  # latest stable
-solana==0.34.3   # latest stable as of 2026
-bip-utils
+python-dotenv
+solana
+solders
